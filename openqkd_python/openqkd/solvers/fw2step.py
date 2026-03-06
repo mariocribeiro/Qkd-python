@@ -164,50 +164,6 @@ def frank_wolfe_loop(rho0, kraus_ops, constraints_fn, key_dim,
 
     return rho, fw_gap, history
 
-
-# ── Dual certificate simplificado (gap linear) ───────────────────────────────
-
-def dual_certificate(rho_star: np.ndarray,
-                     kraus_ops: List[np.ndarray],
-                     constraints_fn: Callable,
-                     key_dim: int,
-                     key_proj: Optional[List[np.ndarray]] = None,
-                     solver: str = "MOSEK") -> dict:
-    """
-    Lower bound via gap de linearização.
-    Não fornece garantia formal — usar apenas para desenvolvimento.
-    Substituído por dual_certificate_winick quando Gamma/gamma_stats
-    estiverem disponíveis.
-    """
-    dim  = rho_star.shape[0]
-    grad = compute_gradient(rho_star, kraus_ops, key_dim, key_proj)
-
-    Grho        = apply_channel(kraus_ops, rho_star)
-    ZGrho       = apply_dephasing(Grho, key_dim, key_proj)
-    upper_bound = quantum_relative_entropy(Grho, ZGrho)
-
-    sigma_var = cp.Variable((dim, dim), hermitian=True)
-    dual_prob = cp.Problem(
-        cp.Maximize(cp.real(cp.trace(grad @ sigma_var))),
-        constraints_fn(sigma_var)
-    )
-    dual_prob.solve(solver=solver)
-
-    if dual_prob.status not in ["optimal", "optimal_inaccurate"]:
-        raise RuntimeError(f"Dual SDP falhou: status={dual_prob.status}")
-
-    max_linear  = float(np.real(dual_prob.value))
-    epsilon     = abs(upper_bound - max_linear)
-    lower_bound = upper_bound - epsilon
-
-    return {
-        "upper_bound": upper_bound,
-        "lower_bound": lower_bound,
-        "epsilon":     epsilon,
-        "gap":         upper_bound - lower_bound,
-    }
-
-
 # ── Dual certificate rigoroso — Winick et al. Teorema 1/2/3 ──────────────────
 
 def dual_certificate_winick(rho_star: np.ndarray,
@@ -339,13 +295,13 @@ def fw2step_solver(rho0: np.ndarray,
                    kraus_ops: List[np.ndarray],
                    constraints_fn: Callable,
                    key_dim: int,
+                   Gamma: List[np.ndarray],
+                   gamma_stats: List[float],
                    leak_ec: float = 0.0,
                    max_iter: int = 100,
                    tol: float = 1e-8,
                    solver: str = "MOSEK",
                    verbose: bool = False,
-                   Gamma: Optional[List[np.ndarray]] = None,
-                   gamma_stats: Optional[List[float]] = None,
                    key_proj: Optional[List[np.ndarray]] = None) -> dict:
     """
     Solver completo: Frank-Wolfe → dual certificate → key rate.
@@ -357,9 +313,9 @@ def fw2step_solver(rho0: np.ndarray,
     constraints_fn: função sigma_var → lista de constraints CVXPY
     key_dim       : dimensão do registro de chave
     leak_ec       : vazamento de correção de erros (bits/round)
-    solver        : "MOSEK" (produção) ou "CLARABEL" (desenvolvimento)
-    verbose       : imprime progresso do FW loop
-    Gamma         : observáveis — ativa certificado rigoroso de Winick
+    solver: str = "MOSEK",  # "MOSEK" (produção) ou "CLARABEL" (desenvolvimento)
+    Gamma: List[np.ndarray],           # observáveis {Γ_i} — obrigatório
+    gamma_stats: List[float],          # estatísticas {γ_i} — obrigatório
     gamma_stats   : estatísticas observadas correspondentes a Gamma
     key_proj      : key projectors do Description module
     """
@@ -374,22 +330,18 @@ def fw2step_solver(rho0: np.ndarray,
 
     if verbose:
         print("── Dual certificate ──")
+    # falha explicitamente se faltar Gamma:
+    if Gamma is None or gamma_stats is None:
+        raise ValueError(
+        )
+    if verbose:
+        print(" (modo rigoroso: Winick et al.")
+    cert = dual_certificate_winick(
+        rho_star, kraus_ops, key_dim,
+        Gamma, gamma_stats,
+        key_proj=key_proj, solver=solver
+    )
 
-    if Gamma is not None and gamma_stats is not None:
-        if verbose:
-            print("  (modo rigoroso: Winick et al. Teorema 1/2/3)")
-        cert = dual_certificate_winick(
-            rho_star, kraus_ops, key_dim,
-            Gamma, gamma_stats,
-            key_proj=key_proj, solver=solver
-        )
-    else:
-        if verbose:
-            print("  (modo simplificado)")
-        cert = dual_certificate(
-            rho_star, kraus_ops, constraints_fn,
-            key_dim, key_proj, solver
-        )
 
     key_rate = max(0.0, cert["lower_bound"] - leak_ec)
 
